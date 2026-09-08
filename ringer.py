@@ -1048,6 +1048,8 @@ class AppConfig:
     artifact: ArtifactConfig
     steering: SteeringConfig = field(default_factory=SteeringConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
+    subscription_only: bool = False
+    subscription_codex_bin: str = ""
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -1074,6 +1076,12 @@ class AppConfig:
         eval_config = load_eval_config(data.get("eval"), state_dir)
         engines = load_engines(data.get("engines"))
         artifact_config = load_artifact_config(data.get("artifact"), state_dir)
+        subscription_only = data.get("subscription_only", False)
+        if not isinstance(subscription_only, bool):
+            raise ValueError("subscription_only must be a boolean")
+        subscription_codex_bin = str(data.get("subscription_codex_bin", "")).strip()
+        if subscription_only and not Path(subscription_codex_bin).is_absolute():
+            raise ValueError("subscription_only requires an absolute subscription_codex_bin")
         update_config = load_update_config(data.get("update"))
         try:
             steering_config = load_steering_config(data.get("steering"))
@@ -1094,6 +1102,8 @@ class AppConfig:
             artifact=artifact_config,
             steering=steering_config,
             update=update_config,
+            subscription_only=subscription_only,
+            subscription_codex_bin=subscription_codex_bin,
         )
 
 
@@ -1444,6 +1454,8 @@ def maybe_self_update(
         resolved_config = config or AppConfig.load(_config_path_from_argv(argv))
     except Exception:
         return SelfUpdateResult("skipped", reason="config unavailable")
+    if resolved_config.subscription_only:
+        return SelfUpdateResult("skipped", reason="subscription policy requires an explicit reviewed upgrade")
     if not resolved_config.update.auto:
         return SelfUpdateResult("skipped", reason="disabled by config")
     return perform_self_update(
@@ -8787,7 +8799,7 @@ class RingerRunner:
                     if worker.tokens is not None:
                         runtime.tokens = (runtime.tokens or 0) + worker.tokens
                 verify = await self.verifier.verify(runtime.task, runtime.taskdir)
-                verdict = verdict_for(worker, verify)
+                verdict = verdict_for(worker, verify, require_worker_success=self.config.subscription_only)
                 with self.lock:
                     runtime.last_check_returncode = verify.check_returncode
                     runtime.last_check_timed_out = verify.check_timed_out
@@ -9011,6 +9023,8 @@ class RingerRunner:
                     "but config allow_full_access is false"
                 ),
             )
+        validate_subscription_policy(self.manifest, self.config)
+        validate_subscription_environment(self.config, [runtime.taskdir])
         cmd = build_worker_command(
             engine,
             taskdir=runtime.taskdir,
@@ -9018,6 +9032,7 @@ class RingerRunner:
             full_access=runtime.task.full_access,
             engine_args=runtime.task.engine_args,
             model=runtime.task.model,
+            subscription_only=self.config.subscription_only,
         )
         command_spec = spec
         if self.config.steering.dir is not None:
@@ -9055,6 +9070,7 @@ class RingerRunner:
                         full_access=runtime.task.full_access,
                         engine_args=runtime.task.engine_args,
                         model=runtime.task.model,
+                        subscription_only=self.config.subscription_only,
                     )
                     command_spec = injected_spec
             except Exception:
@@ -9131,7 +9147,10 @@ class RingerRunner:
         if timed_out:
             append_text(log_path, f"\n[ringer.py] worker timed out after {runtime.task.timeout_s}s\n")
         append_text(log_path, f"[ringer.py] attempt {attempt} exited rc={proc.returncode}\n")
+        infrastructure_error = (subscription_execution_error(proc.returncode, output_tail)
+                                if self.config.subscription_only else None)
         return WorkerResult(
+            error=infrastructure_error,
             returncode=proc.returncode,
             timed_out=timed_out,
             tokens=tokens,
@@ -9199,6 +9218,15 @@ class RingerRunner:
             notes_parts.append(f"worker_error={worker.error}")
         if verify.missing_files:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
+        if self.config.subscription_only:
+            options = subscription_options(runtime.task)
+            notes_parts.extend([
+                "access_policy=chatgpt-subscription-only",
+                f"requested_model={resolved_model}",
+                f"requested_effort={options['model_reasoning_effort']}",
+                f"observed_model={reported_model or 'unknown'}", "observed_effort=unknown",
+                "auth_preflight=chatgpt; billing_attestation=unavailable",
+            ])
         notes_parts.append("raw_check_output_first_2000_chars:")
         notes_parts.append(verify.raw_output_excerpt)
         with contextlib.suppress(Exception):
@@ -9353,11 +9381,13 @@ class AsyncFileCloser:
         self.fh.close()
 
 
-def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
+def verdict_for(worker: WorkerResult, verify: VerifyResult, *, require_worker_success: bool = False) -> str:
     if worker.error:
         return "ERROR"
     if worker.timed_out or verify.check_timed_out:
         return "TIMEOUT"
+    if require_worker_success and worker.returncode != 0:
+        return "FAIL"
     if verify.ok:
         return "PASS"
     return "FAIL"
@@ -9498,6 +9528,119 @@ def resolved_task_model(
     )
 
 
+# This is a local launch policy, not a network firewall or billing attestation.
+# The allowlist is deliberately conservative; availability still requires a probe.
+SUBSCRIPTION_MODELS = {
+    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex-spark",
+}
+SUBSCRIPTION_ENGINES = {"codex", "codex-subscription", "codex-subscription-search"}
+SUBSCRIPTION_AUTH_ARGS = (
+    "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"',
+)
+
+
+def subscription_options(task: TaskSpec) -> dict[str, str]:
+    args = task.engine_args
+    result: dict[str, str] = {}
+    if len(args) % 2:
+        raise ValueError(f"task {task.key}: subscription overrides must be -c key=value pairs")
+    for offset in range(0, len(args), 2):
+        flag, assignment = args[offset:offset + 2]
+        key, separator, value = assignment.partition("=")
+        if flag != "-c" or not separator or key not in {"model_reasoning_effort", "service_tier"}:
+            raise ValueError(f"task {task.key}: unsupported subscription override")
+        if key in result:
+            raise ValueError(f"task {task.key}: duplicate subscription override {key}")
+        value = value.strip()
+        if value.startswith(('"', "'")):
+            try:
+                value = tomllib.loads("value=" + value)["value"]
+            except (tomllib.TOMLDecodeError, KeyError):
+                raise ValueError(f"task {task.key}: invalid subscription override") from None
+        choices = ({"low", "medium", "high", "xhigh", "max", "ultra"}
+                   if key == "model_reasoning_effort" else {"default", "priority"})
+        if not isinstance(value, str) or value not in choices:
+            raise ValueError(f"task {task.key}: unsupported {key}")
+        result[key] = value
+    effort = result.get("model_reasoning_effort")
+    if not effort:
+        raise ValueError(f"task {task.key}: explicit model_reasoning_effort is required")
+    if task.model in {"gpt-5.6-luna", "gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex-spark"} and effort == "ultra":
+        raise ValueError(f"task {task.key}: ultra is not supported for {task.model}")
+    if task.model in {"gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex-spark"} and effort == "max":
+        raise ValueError(f"task {task.key}: max is not supported for {task.model}")
+    return result
+
+
+def validate_subscription_policy(manifest: Manifest, config: AppConfig) -> None:
+    if not config.subscription_only:
+        return
+    if not Path(config.subscription_codex_bin).is_absolute():
+        raise ValueError("subscription_only requires a pinned absolute Codex binary")
+    for task in manifest.tasks:
+        engine = config.engines.get(task.engine)
+        if task.engine not in SUBSCRIPTION_ENGINES or engine is None:
+            raise ValueError(f"task {task.key}: subscription_only rejects engine {task.engine}")
+        if Path(engine.bin).resolve() != Path(config.subscription_codex_bin).resolve():
+            raise ValueError(f"task {task.key}: engine does not match pinned Codex binary")
+        if task.model not in SUBSCRIPTION_MODELS:
+            raise ValueError(f"task {task.key}: explicit allowed subscription model is required")
+        if task.full_access:
+            raise ValueError(f"task {task.key}: subscription policy requires workspace-write sandbox")
+        subscription_options(task)
+
+
+def validate_subscription_environment(config: AppConfig, paths: Iterable[Path]) -> None:
+    if not config.subscription_only:
+        return
+    # Never print credential values. Unknown endpoint customizations fail closed.
+    forbidden_env = ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL",
+                     "CHATGPT_BASE_URL", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL")
+    if any(os.environ.get(key) for key in forbidden_env):
+        raise ValueError("subscription_only rejects API credential or endpoint environment overrides")
+    config_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    candidates = {config_home / "config.toml"}
+    for start in paths:
+        root = start.resolve()
+        candidates.update(parent / ".codex" / "config.toml" for parent in (root, *root.parents))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            data = tomllib.load(stream)
+        if (data.get("chatgpt_base_url") or data.get("profile")
+                or "openai" in data.get("model_providers", {})):
+            raise ValueError(f"subscription_only rejects custom OpenAI endpoint/provider/profile config: {path}")
+
+
+def subscription_execution_error(returncode: int | None, output: str) -> str | None:
+    """Do not spend an artifact-repair retry on a failed subscription login/quota."""
+    if returncode in (None, 0):
+        return None
+    if re.search(r"usage limit|rate limit|insufficient_quota|quota exceeded|(?:http|status(?: code)?)[ :]+429", output, re.IGNORECASE):
+        return "subscription quota/rate limit: stopped without repair retry or provider fallback"
+    if re.search(r"not logged in|authentication failed|invalid authentication|unauthorized|refresh.token.*(?:expired|invalid|failed)|(?:http|status(?: code)?)[ :]+401", output, re.IGNORECASE):
+        return "subscription authentication failure: stopped without repair retry or provider fallback"
+    return None
+
+
+def preflight_subscription_auth(config: AppConfig) -> None:
+    if not config.subscription_only:
+        return
+    try:
+        result = subprocess.run(
+            [config.subscription_codex_bin, *SUBSCRIPTION_AUTH_ARGS, "login", "status"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("subscription ChatGPT login preflight failed") from exc
+    status = (result.stdout + result.stderr).strip()
+    if result.returncode != 0 or status != "Logged in using ChatGPT":
+        raise ValueError("subscription_only requires a verified ChatGPT login; no fallback is allowed")
+
+
 def build_worker_command(
     engine: EngineConfig,
     *,
@@ -9506,7 +9649,23 @@ def build_worker_command(
     full_access: bool,
     engine_args: tuple[str, ...] = (),
     model: str = "",
+    subscription_only: bool = False,
 ) -> list[str]:
+    if subscription_only:
+        # Never execute an arbitrary configured args_template under this policy.
+        task = TaskSpec(key="command", spec=spec, check="unused", model=model, engine_args=engine_args)
+        options = subscription_options(task)
+        if model not in SUBSCRIPTION_MODELS or full_access:
+            raise ValueError("invalid subscription command model/access")
+        canonical = [engine.bin, *SUBSCRIPTION_AUTH_ARGS]
+        if engine.name == "codex-subscription-search":
+            canonical.append("--search")
+        canonical.extend(["exec", "--skip-git-repo-check", "-m", model,
+                          "--sandbox", "workspace-write"])
+        for key, value in options.items():
+            canonical.extend(["-c", f"{key}={json.dumps(value)}"])
+        return [*canonical, "-C", str(taskdir), "--", spec]
+
     access_args = engine.full_access_args if full_access else engine.sandbox_args
     resolved_model = model or engine.model_default
     command = [engine.bin]
@@ -9553,6 +9712,7 @@ def print_steering_notes(manifest: Manifest, config: AppConfig) -> None:
                         full_access=task.full_access,
                         engine_args=task.engine_args,
                         model=task.model,
+                        subscription_only=config.subscription_only,
                     )
                 model = resolved_task_model(task, engine, command)
                 if not model or model in seen_models:
@@ -9612,6 +9772,9 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
 
 
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
+    validate_subscription_policy(manifest, config)
+    if config.subscription_only:
+        return  # The canonical subscription command replaces configured templates.
     missing = sorted({task.engine for task in manifest.tasks if task.engine not in config.engines})
     if missing:
         raise ValueError(f"unknown worker engine(s): {', '.join(missing)}")
@@ -10047,6 +10210,7 @@ def dry_run(
                 full_access=task.full_access,
                 engine_args=task.engine_args,
                 model=task.model,
+                subscription_only=config.subscription_only,
             )
             if engine is not None
             else []
@@ -10316,7 +10480,9 @@ def run_one_request(config: AppConfig, args: argparse.Namespace) -> int:
         redact=args.redact,
     )
     validate_manifest_engines(manifest, config)
+    validate_subscription_environment(config, [workdir])
     preflight_engine_bins(manifest, config)
+    preflight_subscription_auth(config)
     identity = resolve_identity(
         args.identity,
         config,
@@ -11037,8 +11203,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "uninstall-agent":
             return uninstall_agent(project=args.project)
 
+        config = AppConfig.load(args.config)
+
         if args.command == "lint":
             manifest = Manifest.from_path(args.manifest)
+            if config.subscription_only:
+                validate_manifest_engines(manifest, config)
+                validate_subscription_environment(config, [manifest.workdir, *([manifest.repo] if manifest.repo else [])])
             findings = lint_manifest(
                 manifest,
                 allow_noncanonical_route=args.allow_noncanonical_route,
@@ -11050,9 +11221,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "catalog":
+            if config.subscription_only and args.refresh:
+                raise ValueError("subscription_only disables OpenRouter catalog refresh")
             return run_catalog_command(args)
 
-        config = AppConfig.load(args.config)
         if args.command == "db":
             return run_db_command(config, args)
         if args.command == "models":
@@ -11085,9 +11257,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         print_lint_findings(lint_findings)
+        if config.subscription_only and lint_findings:
+            raise ValueError("subscription_only requires a clean manifest lint")
         if any(finding.startswith("ERROR:") for finding in lint_findings):
             return 1
         validate_manifest_engines(manifest, config)
+        validate_subscription_environment(config, [manifest.workdir, *([manifest.repo] if manifest.repo else [])])
         identity_start_paths = [manifest.workdir]
         if manifest.source_path is not None:
             identity_start_paths.append(manifest.source_path.parent)
@@ -11109,7 +11284,8 @@ def main(argv: list[str] | None = None) -> int:
             # workers, so a missing engine binary must not block it.
             return asyncio.run(run_baseline(manifest, config=config))
         preflight_engine_bins(manifest, config)
-        if args.command == "run":
+        preflight_subscription_auth(config)
+        if args.command == "run" and not config.subscription_only:
             start_catalog_auto_refresh()
         if dashboard_enabled and not args.browser:
             ensure_hud_running(config, open_browser=True)
