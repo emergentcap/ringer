@@ -1,3 +1,9 @@
+# Optional ChatGPT subscription launch policy; see docs/SUBSCRIPTION-POLICY.md.
+# Enabling also skips automatic startup self-update; explicit self-update remains available.
+subscription_only = false
+# Required absolute executable path when subscription_only is true.
+subscription_codex_bin = ""
+
 # Sample config for ringer.py.
 # Copy to ~/.config/ringer/config.toml or pass with --config /path/to/config.toml.
 
